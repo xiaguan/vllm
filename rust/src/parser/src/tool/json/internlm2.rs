@@ -19,6 +19,7 @@ const INTERNLM2_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     // and reject the trailing one as a syntax error rather than silently
     // shadowing it.
     arguments_key: &["parameters", "arguments"],
+    allow_markdown_fence: false,
 };
 
 /// Tool parser for InternLM2 special-token wrapped JSON tool calls.

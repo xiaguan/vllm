@@ -213,12 +213,14 @@ fn llama_tool_call_header_event(input: &mut JsonToolInput<'_>) -> ModalResult<Ll
         delimiter: Some(";"),
         name_key: "name",
         arguments_key: &["parameters"],
+        allow_markdown_fence: false,
     };
 
     match tool_call_header_event(input, CONFIG)? {
-        JsonToolCallEvent::ToolCallHeader { function_name } => {
-            Ok(LlamaJsonEvent::ToolCallHeader { function_name })
-        }
+        JsonToolCallEvent::ToolCallHeader {
+            function_name,
+            markdown_fenced: _,
+        } => Ok(LlamaJsonEvent::ToolCallHeader { function_name }),
         _ => unreachable!("tool_call_header_event only emits ToolCallHeader"),
     }
 }

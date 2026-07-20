@@ -50,6 +50,7 @@ const INKLING_TOOL_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     delimiter: None,
     name_key: "name",
     arguments_key: &["args"],
+    allow_markdown_fence: false,
 };
 
 type InklingInput<'i> = Partial<&'i str>;
@@ -362,7 +363,10 @@ fn safe_reasoning_event(input: &mut InklingInput<'_>) -> ModalResult<InklingEven
 /// Parse a Inkling JSON tool-call header.
 fn parse_tool_json_header_event(input: &mut InklingInput<'_>) -> ModalResult<InklingEvent> {
     match tool_call_header_event(input, INKLING_TOOL_CONFIG)? {
-        JsonToolCallEvent::ToolCallHeader { function_name } => Ok(InklingEvent::ToolJsonHeader {
+        JsonToolCallEvent::ToolCallHeader {
+            function_name,
+            markdown_fenced: _,
+        } => Ok(InklingEvent::ToolJsonHeader {
             name: function_name,
         }),
         _ => unreachable!("tool_call_header_event only emits ToolCallHeader"),

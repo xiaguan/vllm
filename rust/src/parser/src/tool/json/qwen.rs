@@ -12,6 +12,7 @@ const QWEN_XML_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     delimiter: None,
     name_key: "name",
     arguments_key: &["arguments"],
+    allow_markdown_fence: true,
 };
 
 /// Tool parser for Qwen XML-wrapped JSON tool calls.
@@ -82,6 +83,12 @@ mod tests {
         )
     }
 
+    fn build_fenced_tool_call(function_name: &str, arguments: &str, opening_fence: &str) -> String {
+        format!(
+            "<tool_call>\n{opening_fence}\n{{\"name\": \"{function_name}\", \"arguments\": {arguments}}}\n```\n</tool_call>"
+        )
+    }
+
     #[test]
     fn qwen_xml_parse_complete_without_tool_call_keeps_text() {
         let mut parser = Qwen3XmlToolParser::new(&test_tools());
@@ -107,6 +114,80 @@ mod tests {
         assert_eq!(output.calls()[0].tool_index, 0);
         assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
         assert_eq!(output.calls()[0].arguments, arguments);
+    }
+
+    #[test]
+    fn qwen_xml_parse_complete_repairs_markdown_fenced_json() {
+        for opening_fence in ["```json", "```"] {
+            let mut parser = Qwen3XmlToolParser::new(&test_tools());
+            let arguments = r#"{"location":"Tokyo"}"#;
+            let output = parser
+                .parse_complete(&build_fenced_tool_call(
+                    "get_weather",
+                    arguments,
+                    opening_fence,
+                ))
+                .unwrap();
+
+            assert_eq!(output.calls().len(), 1);
+            assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+            assert_eq!(output.calls()[0].arguments, arguments);
+        }
+    }
+
+    #[test]
+    fn qwen_xml_streaming_commits_fenced_call_atomically() {
+        let input = build_fenced_tool_call("get_weather", r#"{"location":"Tokyo"}"#, "```json");
+        let chunks = split_by_chars(&input, 5);
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+        let mut output = ToolParserOutput::default();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let next = parser.parse_chunk(chunk).unwrap();
+            if index + 1 < chunks.len() {
+                assert!(next.calls().is_empty());
+            }
+            output.append(next);
+        }
+        output.append(parser.finish().unwrap());
+
+        let output = output.coalesce();
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].arguments, r#"{"location":"Tokyo"}"#);
+    }
+
+    #[test]
+    fn qwen_xml_unmatched_markdown_fence_is_recoverable() {
+        let input = r#"<tool_call>
+```json
+{"name":"get_weather","arguments":{"location":"Tokyo"}}
+</tool_call>"#;
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+        let mut output = ToolParserOutput::default();
+
+        let error = parser.parse_into(input, &mut output).unwrap_err();
+
+        assert!(error.to_report_string().starts_with("tool parser parsing failed:"));
+        assert!(output.calls().is_empty());
+        assert_eq!(parser.reset(), input);
+    }
+
+    #[test]
+    fn qwen_xml_rejects_invalid_json_inside_markdown_fence() {
+        let input = build_fenced_tool_call("get_weather", r#"{"location":"Tokyo",}"#, "```json");
+        let mut parser = Qwen3XmlToolParser::new(&test_tools());
+        let mut output = ToolParserOutput::default();
+
+        let error = parser.parse_into(&input, &mut output).unwrap_err();
+
+        assert!(
+            error
+                .to_report_string()
+                .starts_with("tool parser parsing failed: invalid fenced Qwen XML arguments:")
+        );
+        assert!(output.calls().is_empty());
+        assert_eq!(parser.reset(), input);
     }
 
     #[test]
