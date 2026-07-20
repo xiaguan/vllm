@@ -12,6 +12,7 @@ const MISTRAL_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     delimiter: Some(","),
     name_key: "name",
     arguments_key: &["arguments"],
+    allow_markdown_fence: false,
 };
 
 /// Tool parser for Mistral JSON-array tool calls.

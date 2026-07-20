@@ -45,6 +45,8 @@ pub(crate) struct JsonToolCallConfig {
     /// Most parsers use a single key like `["arguments"]`, but some accept
     /// multiple (e.g. InternLM2 accepts `parameters` or `arguments`).
     pub arguments_key: &'static [&'static str],
+    /// Accept one matching Markdown fence around the tool-call JSON.
+    pub allow_markdown_fence: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,17 +59,36 @@ pub(crate) enum JsonToolCallWhitespace {
 enum JsonToolCallMode {
     Text,
     Header,
-    Arguments { json_scan: JsonObjectScanState },
+    Arguments {
+        json_scan: JsonObjectScanState,
+        markdown_fenced: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum JsonToolCallEvent {
-    Text { len: usize },
+    Text {
+        len: usize,
+    },
     ToolCallStart,
-    ToolCallHeader { function_name: String },
-    Arguments { len: usize },
+    ToolCallHeader {
+        function_name: String,
+        markdown_fenced: bool,
+    },
+    Arguments {
+        len: usize,
+    },
     ToolCallDelimiter,
-    ToolCallEnd,
+    ToolCallEnd {
+        markdown_fenced: bool,
+    },
+}
+
+#[derive(Debug)]
+struct PendingFencedToolCall {
+    tool_index: usize,
+    function_name: String,
+    arguments_start: usize,
 }
 
 /// Tool parser core for marker-wrapped JSON tool calls.
@@ -78,17 +99,30 @@ struct JsonToolCallParser {
     mode: JsonToolCallMode,
     active_tool_index: Option<usize>,
     emitted_tool_count: usize,
+    pending_fenced_raw: String,
+    pending_fenced_call: Option<PendingFencedToolCall>,
 }
 
 impl JsonToolCallParser {
     /// Create a marker-wrapped JSON tool-call parser.
     fn new(config: JsonToolCallConfig) -> Self {
+        assert!(
+            !config.allow_markdown_fence || config.delimiter.is_none(),
+            "Markdown-fenced JSON requires one tool call per marker"
+        );
+        assert!(
+            !config.allow_markdown_fence
+                || matches!(config.marker_whitespace, JsonToolCallWhitespace::Exact(_)),
+            "Markdown-fenced JSON requires exact marker whitespace"
+        );
         Self {
             config,
             buffer: String::new(),
             mode: JsonToolCallMode::Text,
             active_tool_index: None,
             emitted_tool_count: 0,
+            pending_fenced_raw: String::new(),
+            pending_fenced_call: None,
         }
     }
 
@@ -99,7 +133,7 @@ impl JsonToolCallParser {
         while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {
             parse_next_json_tool_call_event(input, &mut self.mode, config)
         })? {
-            self.apply_event(event, output)?;
+            self.apply_event(event, consumed_len, output)?;
             self.buffer.drain(..consumed_len);
         }
 
@@ -125,6 +159,7 @@ impl JsonToolCallParser {
     fn apply_event(
         &mut self,
         event: JsonToolCallEvent,
+        consumed_len: usize,
         output: &mut ToolParserOutput,
     ) -> Result<()> {
         match event {
@@ -132,18 +167,38 @@ impl JsonToolCallParser {
                 output.push_text(&self.buffer[..consumed_len]);
             }
             JsonToolCallEvent::ToolCallStart => self.mode = JsonToolCallMode::Header,
-            JsonToolCallEvent::ToolCallHeader { function_name } => {
+            JsonToolCallEvent::ToolCallHeader {
+                function_name,
+                markdown_fenced,
+            } => {
                 let tool_index = self.emitted_tool_count;
                 self.emitted_tool_count += 1;
                 self.active_tool_index = Some(tool_index);
                 self.mode = JsonToolCallMode::Arguments {
                     json_scan: JsonObjectScanState::default(),
+                    markdown_fenced,
                 };
-                output.push_call(ToolCallDelta {
-                    tool_index,
-                    name: Some(function_name),
-                    arguments: String::new(),
-                });
+                if markdown_fenced {
+                    let JsonToolCallWhitespace::Exact(marker_whitespace) =
+                        self.config.marker_whitespace
+                    else {
+                        unreachable!("fenced parser configuration was checked at construction");
+                    };
+                    self.pending_fenced_raw.push_str(self.config.start_marker);
+                    self.pending_fenced_raw.push_str(marker_whitespace);
+                    self.pending_fenced_raw.push_str(&self.buffer[..consumed_len]);
+                    self.pending_fenced_call = Some(PendingFencedToolCall {
+                        tool_index,
+                        function_name,
+                        arguments_start: self.pending_fenced_raw.len(),
+                    });
+                } else {
+                    output.push_call(ToolCallDelta {
+                        tool_index,
+                        name: Some(function_name),
+                        arguments: String::new(),
+                    });
+                }
             }
             JsonToolCallEvent::Arguments { len: consumed_len } => {
                 let Some(tool_index) = self.active_tool_index else {
@@ -152,17 +207,55 @@ impl JsonToolCallParser {
                         self.config.parser_name
                     ));
                 };
-                output.push_call(ToolCallDelta {
-                    tool_index,
-                    name: None,
-                    arguments: self.buffer[..consumed_len].to_string(),
-                });
+                if matches!(
+                    &self.mode,
+                    JsonToolCallMode::Arguments {
+                        markdown_fenced: true,
+                        ..
+                    }
+                ) {
+                    self.pending_fenced_raw.push_str(&self.buffer[..consumed_len]);
+                } else {
+                    output.push_call(ToolCallDelta {
+                        tool_index,
+                        name: None,
+                        arguments: self.buffer[..consumed_len].to_string(),
+                    });
+                }
             }
             JsonToolCallEvent::ToolCallDelimiter => {
                 self.active_tool_index = None;
                 self.mode = JsonToolCallMode::Header;
             }
-            JsonToolCallEvent::ToolCallEnd => {
+            JsonToolCallEvent::ToolCallEnd { markdown_fenced } => {
+                if markdown_fenced {
+                    let Some(pending) = self.pending_fenced_call.as_ref() else {
+                        return Err(parsing_failed!(
+                            "{} fenced tool call ended without a header",
+                            self.config.parser_name
+                        ));
+                    };
+                    let arguments = &self.pending_fenced_raw[pending.arguments_start..];
+                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(arguments)
+                        .map_err(|error| {
+                        parsing_failed!(
+                            "invalid fenced {} arguments: {}",
+                            self.config.parser_name,
+                            error
+                        )
+                    })?;
+                    let arguments = arguments.to_string();
+                    let pending = self
+                        .pending_fenced_call
+                        .take()
+                        .expect("fenced tool call was checked above");
+                    output.push_call(ToolCallDelta {
+                        tool_index: pending.tool_index,
+                        name: Some(pending.function_name),
+                        arguments,
+                    });
+                    self.pending_fenced_raw.clear();
+                }
                 self.active_tool_index = None;
                 self.mode = JsonToolCallMode::Text;
             }
@@ -171,10 +264,25 @@ impl JsonToolCallParser {
     }
 
     fn reset(&mut self) -> String {
+        let pending_tool_call_start =
+            self.config.allow_markdown_fence && matches!(self.mode, JsonToolCallMode::Header);
         self.mode = JsonToolCallMode::Text;
         self.active_tool_index = None;
         self.emitted_tool_count = 0;
-        std::mem::take(&mut self.buffer)
+        self.pending_fenced_call = None;
+
+        let mut uncommitted = String::new();
+        if pending_tool_call_start {
+            let JsonToolCallWhitespace::Exact(marker_whitespace) = self.config.marker_whitespace
+            else {
+                unreachable!("fenced parser configuration was checked at construction");
+            };
+            uncommitted.push_str(self.config.start_marker);
+            uncommitted.push_str(marker_whitespace);
+        }
+        uncommitted.push_str(&std::mem::take(&mut self.pending_fenced_raw));
+        uncommitted.push_str(&std::mem::take(&mut self.buffer));
+        uncommitted
     }
 }
 
@@ -187,9 +295,10 @@ fn parse_next_json_tool_call_event(
     match mode {
         JsonToolCallMode::Text => parse_text_event(input, config),
         JsonToolCallMode::Header => tool_call_header_event(input, config),
-        JsonToolCallMode::Arguments { json_scan } => {
-            parse_arguments_event(input, json_scan, config)
-        }
+        JsonToolCallMode::Arguments {
+            json_scan,
+            markdown_fenced,
+        } => parse_arguments_event(input, json_scan, *markdown_fenced, config),
     }
 }
 
@@ -224,27 +333,47 @@ pub(crate) fn tool_call_header_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    let (function_name,) = seq!(
-        _: ws0,
-        _: literal("{"),
-        _: ws0,
-        _: |input: &mut JsonToolInput<'_>| json_key(input, config.name_key),
-        _: ws0,
-        _: literal(":"),
-        _: ws0,
-        json_str,
-        _: ws0,
-        _: literal(","),
-        _: ws0,
-        _: |input: &mut JsonToolInput<'_>| json_arguments_key(input, config.arguments_key),
-        _: ws0,
-        _: literal(":"),
-        _: ws0,
-    )
+    let (markdown_fenced, function_name) = (|input: &mut JsonToolInput<'_>| {
+        let _ = ws0.parse_next(input)?;
+        let markdown_fenced = markdown_fence_start(input, config.allow_markdown_fence)?;
+        if markdown_fenced {
+            let _ = ws0.parse_next(input)?;
+        }
+        let (function_name,) = seq!(
+            _: literal("{"),
+            _: ws0,
+            _: |input: &mut JsonToolInput<'_>| json_key(input, config.name_key),
+            _: ws0,
+            _: literal(":"),
+            _: ws0,
+            json_str,
+            _: ws0,
+            _: literal(","),
+            _: ws0,
+            _: |input: &mut JsonToolInput<'_>| json_arguments_key(input, config.arguments_key),
+            _: ws0,
+            _: literal(":"),
+            _: ws0,
+        )
+        .parse_next(input)?;
+        Ok((markdown_fenced, function_name))
+    })
     .context(StrContext::Label(config.parser_name))
     .parse_next(input)?;
 
-    Ok(JsonToolCallEvent::ToolCallHeader { function_name })
+    Ok(JsonToolCallEvent::ToolCallHeader {
+        function_name,
+        markdown_fenced,
+    })
+}
+
+/// Parse a Markdown fence when the next non-whitespace byte starts one.
+fn markdown_fence_start(input: &mut JsonToolInput<'_>, enabled: bool) -> ModalResult<bool> {
+    if !enabled || !input.starts_with('`') {
+        return Ok(false);
+    }
+
+    alt((literal("```json\n"), literal("```\n"))).value(true).parse_next(input)
 }
 
 /// Parse a configured JSON object key.
@@ -295,10 +424,11 @@ fn json_arguments_key(
 fn parse_arguments_event(
     input: &mut JsonToolInput<'_>,
     json_scan: &mut JsonObjectScanState,
+    markdown_fenced: bool,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
     if json_scan.complete() {
-        tool_call_close_event(input, config)
+        tool_call_close_event(input, markdown_fenced, config)
     } else {
         argument_delta_event(input, json_scan)
     }
@@ -315,31 +445,44 @@ fn argument_delta_event(
 /// Parse a marker-wrapped JSON tool-call close marker.
 fn tool_call_close_event(
     input: &mut JsonToolInput<'_>,
+    markdown_fenced: bool,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
     seq!(_: ws0, _: literal("}")).parse_next(input)?;
 
     match config.delimiter {
         Some(delimiter) => alt((
-            |input: &mut JsonToolInput<'_>| tool_call_end_event(input, config),
+            |input: &mut JsonToolInput<'_>| tool_call_end_event(input, markdown_fenced, config),
             |input: &mut JsonToolInput<'_>| tool_call_delimiter_event(input, delimiter),
         ))
         .parse_next(input),
-        None => tool_call_end_event(input, config),
+        None => tool_call_end_event(input, markdown_fenced, config),
     }
 }
 
 /// Parse a marker-wrapped JSON tool-call end marker.
 fn tool_call_end_event(
     input: &mut JsonToolInput<'_>,
+    markdown_fenced: bool,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    seq!(
-        _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
-        _: literal(config.end_marker),
-    )
-    .value(JsonToolCallEvent::ToolCallEnd)
-    .parse_next(input)
+    if markdown_fenced {
+        seq!(
+            _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
+            _: literal("```"),
+            _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
+            _: literal(config.end_marker),
+        )
+        .value(JsonToolCallEvent::ToolCallEnd { markdown_fenced })
+        .parse_next(input)
+    } else {
+        seq!(
+            _: |input: &mut JsonToolInput<'_>| marker_whitespace(input, config),
+            _: literal(config.end_marker),
+        )
+        .value(JsonToolCallEvent::ToolCallEnd { markdown_fenced })
+        .parse_next(input)
+    }
 }
 
 /// Parse a delimiter between JSON tool calls inside one marker block.
@@ -387,6 +530,7 @@ mod tests {
         delimiter: Some("<"),
         name_key: "function",
         arguments_key: &["parameters"],
+        allow_markdown_fence: false,
     };
 
     fn build_tool_call(function_name: &str, arguments: &str) -> String {

@@ -13,6 +13,7 @@ const PHI4MINI_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
     name_key: "name",
     // Accept both key variants emitted by Phi-4 Mini tool-call templates.
     arguments_key: &["arguments", "parameters"],
+    allow_markdown_fence: false,
 };
 
 /// Tool parser for phi-4-mini models.
